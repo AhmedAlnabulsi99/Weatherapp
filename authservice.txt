@@ -1,0 +1,210 @@
+Delete the KinD cluster if any and recreate it for Ingress:
+
+kind delete cluster
+cat <<EOF | kind create cluster --config=-
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 80
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 443
+    protocol: TCP
+EOF
+Install the ingress controller:
+
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+Create a directory for Kubernetes manifests:
+
+mkdir kubernetes-lab
+In VS Code, create a subdirectory for the authentication service.
+
+Deploying the MySQL database
+Create a subdirectory for the MySQL deployment.
+
+Create the following manifests for MySQL:
+
+# headless-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+spec:
+  ports:
+    - port: 3306
+  clusterIP: None
+  selector:
+    app: mysql
+Create the necessary Secret:
+
+kubectl create secret generic mysql-secret \
+  --from-literal=root-password='secure-root-pw' \
+  --from-literal=auth-password='my-secret-pw' \
+  --from-literal=secret-key='xco0sr0fh4e52x03g9mv'
+# init-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mysql-init-job
+spec:
+  template:
+    spec:
+      containers:
+      - name: mysql-init-container
+        image: mysql:5.7
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: root-password
+        - name: MYSQL_AUTH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: auth-password
+        - name: MYSQL_HOST
+          value: "mysql"  # Set the MySQL Service name or hostname
+        - name: MYSQL_PORT
+          value: "3306"  # MySQL port, default is 3306
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mysql -h${MYSQL_HOST} -P${MYSQL_PORT} -uroot -p${MYSQL_ROOT_PASSWORD} <<EOF
+          CREATE DATABASE IF NOT EXISTS weatherapp;
+          CREATE USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_AUTH_PASSWORD}';
+          GRANT ALL PRIVILEGES ON weatherapp.* TO '${MYSQL_USER}'@'%';
+          FLUSH PRIVILEGES;
+          EOF
+      restartPolicy: Never
+# statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  serviceName: "mysql"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:5.7
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: root-password
+  volumeClaimTemplates:
+  - metadata:
+      name: mysql-persistent-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "standard"
+      resources:
+        requests:
+          storage: 10Gi
+Apply the manifests in order:
+
+kubectl apply -f headless-service.yaml
+kubectl apply -f statefulset.yaml # (fix the typo)
+Make sure we have the pod and the service:
+
+kubectl get pods
+kubectl get svc
+Run the init job to create the user:
+
+kubectl apply -f init-job.yaml
+kubectl get pods # ensure that the job has completed
+Ensure that our user has access to the weahterapp database:
+
+kubectl exec -it mysql-0 -- mysql -u authuser -pmy-secret-pw
+SHOW DATABASES;
+USE weatherapp;
+Deploying the Authentication service
+Create the following Deployment for the authentication service:
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weatherapp-auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: weatherapp-auth
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: weatherapp-auth
+    spec:
+      containers:
+      - name: weatherapp-auth
+        image: afakharany/weatherapp-auth:lab
+        imagePullPolicy: IfNotPresent
+        ports:
+          - containerPort: 8080
+        env:
+          - name: DB_HOST
+            value: mysql
+          - name: DB_USER
+            value: authuser
+          - name: DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: mysql-secret
+                key: auth-password
+          - name: DB_NAME
+            value: weatherapp
+          - name: DB_PORT
+            value: "3306"
+          - name: SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: mysql-secret
+                key: secret-key
+Create the Service:
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: weatherapp-auth
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: weatherapp-auth
+View the pods and the service:
+
+kubectl get pods
+kubectl get services
+Test that the service is running:
+
+kubectl run alpine --rm -it --image=alpine -- sh
+apk add curl
+curl -X POST http://weatherapp-auth:8080/users \
+-H "Content-Type: application/json" \
+-d '{"username": "testuser", "password": "testpassword"}'
+# Should return {"success":"User added successfully"}
+ 
